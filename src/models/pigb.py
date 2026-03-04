@@ -65,6 +65,7 @@ def _as_2d(X: Array) -> Array:
         raise ValueError(f"X must be 2D array, got shape {X.shape}")
     return X
 
+
 # ----------------------------
 # Sampling utilities (simple baseline)
 # ----------------------------
@@ -121,6 +122,7 @@ def sample_terminal_logS_uniform(
     t = np.full(n, T, dtype=float)
     return np.column_stack([S, t])
 
+
 def _as_1d(y: Array) -> Array:
     y = np.asarray(y, dtype=float).reshape(-1)
     return y
@@ -156,7 +158,6 @@ def _maybe_fit_with_weights(learner: Any, X: Array, y: Array, w: Optional[Array]
         if "sample_weight" in sig.parameters:
             return learner.fit(X, y, sample_weight=w)
     except Exception:
-        # If inspect fails, fall back
         pass
 
     # Last attempt: call with sample_weight and catch
@@ -177,21 +178,18 @@ class PIGB:
         Number of boosting rounds.
     interior_learner_factory : callable
         A function that returns a *fresh* interior weak learner (smooth).
-        Example: lambda: RidgeBasisLearner(RBFMap(...), lam=...)
     boundary_learner_factory : callable
-        A function that returns a *fresh* boundary weak learner (trees).
-        Example: lambda: TreeLearner(max_depth=3, ...)
+        A function that returns a *fresh* boundary weak learner.
     pde_residual_fn : callable
         Function computing PDE residuals on interior points:
             pde_residual_fn(predict_fn, X_pde) -> residual vector (n_pde,)
-        This implements R_PDE(z) = L f(z) (or your chosen PDE residual).
     bc_target_fn : callable
         Function giving boundary/terminal targets:
             bc_target_fn(X_bc) -> g vector (n_bc,)
     nu_int : float or list[float]
-        Interior learning rate(s) nu_b^int.
+        Interior learning rate(s).
     nu_bdry : float or list[float]
-        Boundary learning rate(s) nu_b^bdry.
+        Boundary learning rate(s).
     f0 : callable or None
         Initial function f0(X) -> vector. If None, starts from 0.
     verbose : bool
@@ -218,6 +216,12 @@ class PIGB:
     _warned_weights_int: bool = False
     _warned_weights_bdry: bool = False
 
+    # stability knobs (can expose later)
+    clip_pde: float = 10.0
+    clip_bc: float = 50.0
+    blowup_abs: float = 1e12  # if predictions exceed this scale, stop early (debug safeguard)
+    use_full_model_for_pde: bool = True
+
     def fit(
         self,
         X_pde: Array,
@@ -228,19 +232,6 @@ class PIGB:
     ) -> "PIGB":
         """
         Fit PIGB using Algorithm 1.
-
-        Inputs
-        ------
-        X_pde : (n_pde, d) array
-            Interior collocation points.
-        X_bc : (n_bc, d) array
-            Boundary/terminal points.
-        w_pde : (n_pde,) array or None
-            Optional interior weights.
-        w_bc : (n_bc,) array or None
-            Optional boundary weights.
-        eval_callback : callable or None
-            If provided, called as eval_callback(b, self) at end of each round.
         """
         X_pde = _as_2d(X_pde)
         X_bc = _as_2d(X_bc)
@@ -260,31 +251,33 @@ class PIGB:
         self.interior_learners_ = []
         self.boundary_learners_ = []
 
-        # Precompute boundary targets g(z) (does not depend on f)
+        # Precompute boundary targets g(z)
         g_bc = _as_1d(self.bc_target_fn(X_bc))
         if g_bc.shape[0] != X_bc.shape[0]:
             raise ValueError("bc_target_fn(X_bc) must return shape (n_bc,).")
 
-        # Define predict_fn closures for residual calculation
-        def predict_fn(X: Array) -> Array:
-            return self.predict(X)
-
         for b in range(1, self.B + 1):
             # --------------------------
-            # Interior step (PDE residuals)
+            # Interior step
             # --------------------------
-            r_pde = _as_1d(self.pde_residual_fn(predict_fn, X_pde))  # R_PDE(z) = L f(z)
+            if self.use_full_model_for_pde:
+                predict_fn_for_pde = lambda X: self.predict(X)
+            else:
+                predict_fn_for_pde = lambda X: self.predict_interior_only(X)
+
+            r_pde = _as_1d(self.pde_residual_fn(predict_fn_for_pde, X_pde))
             if r_pde.shape[0] != X_pde.shape[0]:
                 raise ValueError("pde_residual_fn must return shape (n_pde,).")
 
-            g_int = -r_pde  # pseudo-residuals
+            g_int = -r_pde
+            if self.clip_pde is not None and self.clip_pde > 0:
+                g_int = np.clip(g_int, -self.clip_pde, self.clip_pde)
 
             h_int = self.interior_learner_factory()
-            # Try weighted fit if supported
             before = h_int
             h_int = _maybe_fit_with_weights(h_int, X_pde, g_int, w_pde)
+
             if (w_pde is not None) and (not self._warned_weights_int):
-                # Detect if weights were ignored by checking signature
                 try:
                     sig = inspect.signature(before.fit)
                     if "sample_weight" not in sig.parameters:
@@ -292,28 +285,27 @@ class PIGB:
                             print("[PIGB] Note: interior learner.fit() has no sample_weight; weights may be ignored.")
                         self._warned_weights_int = True
                 except Exception:
-                    # Can't inspect; just warn once in verbose mode
                     if self.verbose:
                         print("[PIGB] Note: could not verify sample_weight support for interior learner.")
                     self._warned_weights_int = True
 
             self.interior_learners_.append(h_int)
 
-            # Update f_{b-1/2} = f_{b-1} + nu_b^int h_b^int
-            # (implemented implicitly via predict() summation)
-
             # --------------------------
-            # Boundary step (BC residuals)
+            # Boundary step
             # --------------------------
-            # f_{b-1/2}(X_bc) = current predict including newly-added interior learner
+            # f_{b-1/2} should include all previous updates plus current interior update.
             f_half = self.predict(X_bc)
-
             r_bc = g_bc - f_half
             g_bdry = r_bc
+
+            if self.clip_bc is not None and self.clip_bc > 0:
+                g_bdry = np.clip(g_bdry, -self.clip_bc, self.clip_bc)
 
             h_bdry = self.boundary_learner_factory()
             before = h_bdry
             h_bdry = _maybe_fit_with_weights(h_bdry, X_bc, g_bdry, w_bc)
+
             if (w_bc is not None) and (not self._warned_weights_bdry):
                 try:
                     sig = inspect.signature(before.fit)
@@ -328,31 +320,58 @@ class PIGB:
 
             self.boundary_learners_.append(h_bdry)
 
-            # Update f_b = f_{b-1/2} + nu_b^bdry h_b^bdry (implicit)
-
             if self.verbose and (b == 1 or b % max(1, self.B // 10) == 0):
-                # Light diagnostics: interior residual RMS and boundary RMS
                 rpde_rms = float(np.sqrt(np.mean(r_pde**2)))
                 rbc_rms = float(np.sqrt(np.mean(r_bc**2)))
                 print(f"[PIGB round {b:4d}] PDE_resid_RMS={rpde_rms:.4g}  BC_resid_RMS={rbc_rms:.4g}")
+
+            # debug safeguard: stop if predictions blow up
+            if self.blowup_abs is not None:
+                y_chk = self.predict_interior_only(X_pde[: min(256, X_pde.shape[0])])
+                if (not np.all(np.isfinite(y_chk))) or (np.max(np.abs(y_chk)) > self.blowup_abs):
+                    if self.verbose:
+                        print(f"[PIGB] Early stop at round {b}: prediction blow-up detected.")
+                    break
 
             if eval_callback is not None:
                 eval_callback(b, self)
 
         return self
 
-    def predict(self, X: Array) -> Array:
+    def predict_interior_only(self, X: Array) -> Array:
         """
-        Predict f(X) after training (or during training).
+        f_int(X) = f0(X) + sum_k nu_k^int h_k^int(X)
 
-        f(X) = f0(X) + sum_{k=1..B} nu_k^int h_k^int(X) + sum_{k=1..B} nu_k^bdry h_k^bdry(X)
-
-        During fitting, the lists may be partially filled; this still works.
+        Used for PDE residual computations to avoid boundary step nonsmoothness.
         """
         X = _as_2d(X)
         n = X.shape[0]
 
-        # Base function
+        if self.f0 is None:
+            y = np.zeros(n, dtype=float)
+        else:
+            y = _as_1d(self.f0(X))
+            if y.shape[0] != n:
+                raise ValueError("f0(X) must return shape (n,).")
+
+        if self.interior_learners_ is None:
+            return y
+
+        B_int = len(self.interior_learners_)
+        for k in range(B_int):
+            nu_i = self.nu_int_list_[k] if self.nu_int_list_ is not None else float(self.nu_int)
+            y = y + nu_i * _as_1d(self.interior_learners_[k].predict(X))
+
+        return y
+
+    def predict(self, X: Array) -> Array:
+        """
+        Predict full model:
+        f(X) = f0(X) + sum_k nu_k^int h_k^int(X) + sum_k nu_k^bdry h_k^bdry(X)
+        """
+        X = _as_2d(X)
+        n = X.shape[0]
+
         if self.f0 is None:
             y = np.zeros(n, dtype=float)
         else:
@@ -363,12 +382,10 @@ class PIGB:
         if self.interior_learners_ is None or self.boundary_learners_ is None:
             return y
 
-        # Determine how many rounds are currently available
         B_int = len(self.interior_learners_)
         B_bdry = len(self.boundary_learners_)
         B_now = min(B_int, B_bdry)
 
-        # Add contributions round by round (to preserve f_{b-1/2} meaning)
         for k in range(B_now):
             nu_i = self.nu_int_list_[k] if self.nu_int_list_ is not None else float(self.nu_int)
             nu_b = self.nu_bdry_list_[k] if self.nu_bdry_list_ is not None else float(self.nu_bdry)
@@ -376,7 +393,6 @@ class PIGB:
             y = y + nu_i * _as_1d(self.interior_learners_[k].predict(X))
             y = y + nu_b * _as_1d(self.boundary_learners_[k].predict(X))
 
-        # If interior learners exist but boundary not yet appended (rare), include remaining interior
         for k in range(B_now, B_int):
             nu_i = self.nu_int_list_[k] if self.nu_int_list_ is not None else float(self.nu_int)
             y = y + nu_i * _as_1d(self.interior_learners_[k].predict(X))
@@ -386,12 +402,10 @@ class PIGB:
     def staged_predict(self, X: Array) -> List[Array]:
         """
         Return predictions after each *full round* (after both interior + boundary update).
-        Useful for plotting training curves.
-
-        Returns a list of length B_now, where entry b-1 is f_b(X).
         """
         X = _as_2d(X)
-        preds = []
+        preds: List[Array] = []
+
         if self.interior_learners_ is None or self.boundary_learners_ is None:
             return preds
 
