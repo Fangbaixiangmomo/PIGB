@@ -1,5 +1,38 @@
-__pycache__/
-.ipynb_checkpoints/
-results/
+# macOS metadata
+.DS_Store
+
+# Local environment files
 .env
-*.pyc
+.env.*
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+pigb_env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Build, packaging, and coverage outputs
+build/
+dist/
+*.egg-info/
+.eggs/
+.coverage
+.coverage.*
+htmlcov/
+
+# Project outputs
+results/
+
+# Logs
+*.log
