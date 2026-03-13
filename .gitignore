@@ -33,6 +33,39 @@ htmlcov/
 
 # Project outputs
 results/
+artifacts/
+checkpoints/
+runs/
+wandb/
+mlruns/
+
+# Large model and dataset artifacts
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.pb
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.pkl
+*.joblib
+*.parquet
+*.feather
+
+# Archives and binary blobs
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.dmg
+*.iso
+*.dylib
+*.so
+*.dll
+*.pdb
 
 # Logs
 *.log

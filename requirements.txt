@@ -2,6 +2,9 @@ numpy
 scipy
 pandas
 matplotlib
+plotly
 scikit-learn
 tqdm
 jupyter
+torch
+deepxde
