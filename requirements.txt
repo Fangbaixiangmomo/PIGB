@@ -1,0 +1,13 @@
+numpy
+scipy
+pandas
+matplotlib
+plotly
+scikit-learn
+yfinance
+xgboost
+catboost
+tqdm
+jupyter
+torch
+deepxde
